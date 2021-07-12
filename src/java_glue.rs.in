@@ -1,0 +1,162 @@
+// src/java_glue.rs.in
+use crate::jni_c_header::*;
+use exogress_common::client_core::Client;
+use exogress_common::entities::{
+    AccessKeyId, AccountName, LabelName, LabelValue, ProfileName, ProjectName, SmolStr,
+};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::{mpsc, oneshot};
+use hashbrown::HashMap;
+use log::info;
+use trust_dns_resolver::TokioHandle;
+use tokio::runtime::Runtime;
+use trust_dns_resolver::TokioAsyncResolver;
+
+const CRATE_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+pub struct Instance {
+    client: parking_lot::Mutex<Option<exogress_common::client_core::Client>>,
+    reload_config_tx: parking_lot::Mutex<UnboundedSender<()>>,
+    reload_config_rx: parking_lot::Mutex<Option<UnboundedReceiver<()>>>,
+    stop_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    stop_rx: parking_lot::Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl Instance {
+    pub fn new(
+      access_key_id: String,
+      secret_access_key: String,
+      account: String,
+      project: String,
+      watch_config: bool,
+//      maybe_config_path: Option<String>,
+    ) -> Result<Self, String> {
+        let access_key_id = access_key_id
+          .parse::<AccessKeyId>()
+          .map_err(|e| e.to_string())?;
+
+        let project = project
+          .parse::<ProjectName>()
+          .map_err(|e| e.to_string())?;
+        let account = account
+          .parse::<AccountName>()
+          .map_err(|e| e.to_string())?;
+
+        let mut client_builder = Client::builder();
+
+//        if let Some(config_path) = maybe_config_path {
+  //          client_builder.config_path(config_path);
+    //    }
+
+        let client = client_builder
+            .access_key_id(access_key_id.clone())
+            .secret_access_key(secret_access_key.clone())
+            .account(account.clone())
+            .project(project.clone())
+            .watch_config(watch_config)
+            .profile(None)
+  //          .labels(labels)
+            .additional_connection_params({
+                let mut map = HashMap::<SmolStr, SmolStr>::new();
+                map.insert("client".into(), "java".into());
+                map.insert("wrapper_version".into(), CRATE_VERSION.into());
+                map
+            })
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let (reload_config_tx, reload_config_rx) = mpsc::unbounded();
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        Ok(Instance {
+            client: parking_lot::Mutex::new(Some(client)),
+            reload_config_tx: parking_lot::Mutex::new(reload_config_tx),
+            reload_config_rx: parking_lot::Mutex::new(Some(reload_config_rx)),
+            stop_tx: parking_lot::Mutex::new(Some(stop_tx)),
+            stop_rx: parking_lot::Mutex::new(Some(stop_rx)),
+        })
+    }
+
+    pub fn spawn(&self) -> Result<(), String> {
+        let rt = Runtime::new().map_err(|e| e.to_string())?;
+
+        let resolver = TokioAsyncResolver::from_system_conf(TokioHandle)
+            .map_err(|e| e.to_string())?;
+
+        let reload_config_rx = self
+            .reload_config_rx
+            .lock()
+            .take()
+            .ok_or_else(|| "instance has already been spawned".to_string())?;
+        let reload_config_tx = self.reload_config_tx.lock().clone();
+
+        let stop_rx = self
+            .stop_rx
+            .lock()
+            .take()
+            .ok_or_else(|| "instance has already been spawned".to_string())?;
+
+        if let Some(client) = self.client.lock().take() {
+            rt.block_on(async move {
+                let spawn = client.spawn(reload_config_tx, reload_config_rx, resolver);
+
+                tokio::select! {
+                    r = spawn => {
+                        if let Err(e) = r {
+                            return Err(e.to_string());
+                        }
+                    },
+                    _ = stop_rx => {
+                        info!("stop exogress instance by request");
+                    }
+                }
+
+                Ok(())
+            })?;
+
+            Ok(())
+        } else {
+            return Err("cannot start already stopped instance".to_string());
+        }
+
+    }
+
+    pub fn stop(&self) -> Result<(), String> {
+        self.stop_tx
+            .lock()
+            .take()
+            .ok_or_else(|| "instance already stopped".to_string())?
+            .send(())
+            .map_err(|_| "failed to send reload request".to_string())
+    }
+
+    pub fn reload(&self) -> Result<(), String> {
+        self.reload_config_tx
+            .lock()
+            .unbounded_send(())
+            .map_err(|e| format!("failed to send reload request: {}", e))
+    }
+}
+
+foreign_class!(class Instance {
+    self_type Instance;
+    constructor Instance::new(
+      access_key_id: String,
+      secret_access_key: String,
+      account: String,
+      project: String,
+      watch_config: bool,
+    ) -> Result<Instance, String>;
+    fn Instance::spawn(&self) -> Result<(), String>;
+    fn Instance::stop(&self) -> Result<(), String> ;
+    fn Instance::reload(&self) -> Result<(), String> ;
+
+    foreign_code r#"
+     static {
+         try {
+             NativeUtils.loadLibraryFromJar();
+         } catch (java.io.IOException e) {
+             e.printStackTrace();
+         }
+     }"#;
+});

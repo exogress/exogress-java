@@ -12,6 +12,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v2
+
+      - name: Install latest stable
+        uses: actions-rs/toolchain@v1
+
+      - uses: Swatinem/rust-cache@v1
+
       - uses: actions/setup-java@v2
         with:
           java-version: '11'
